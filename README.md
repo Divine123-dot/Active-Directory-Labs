@@ -197,7 +197,7 @@ DNS Servers:     192.168.1.10
 Lease Obtained:  29 August 2026
 Lease Expires:   6 September 2026
 ```
-This confirms the DHCP server is correctly authorized, scoped, and serving addresses/reservations to real clients on the network — not just installed without error.
+This confirms the DHCP server is correctly authorized, scoped, and serving addresses/reservations to real clients on the network not just installed without error.
 
 ## Troubleshooting Log
 
@@ -225,6 +225,124 @@ This confirms the DHCP server is correctly authorized, scoped, and serving addre
 - Root-cause diagnosis of a recurring Kerberos/clock-sync issue, resolved permanently at the hypervisor level rather than patched repeatedly
 - Local vs. domain account permission troubleshooting in Active Directory contexts
 
+# Windows Infrastructure Lab
+
+A second-server infrastructure build for the `divine.lab` domain, providing DHCP, DNS support, File Server, and Backup services deliberately separated from the Domain Controller to reflect real-world role separation rather than piling every service onto one box.
+
+## Environment
+
+| Component | Details |
+|---|---|
+| Hypervisor | Oracle VirtualBox |
+| Domain Controller (existing) | Windows Server 2022 (`Berlin-DC-01`) — AD DS + DNS |
+| Infrastructure Server (new) | Windows Server 2022 (`BERLIN-FS-01`, VM name `FileServer03`) DHCP, File Server, Backup |
+| Domain | `divine.lab` |
+| Network | Internal Network (isolated lab, static IPs) |
+| BERLIN-FS-01 static IP | `192.168.1.20` |
+
+**Design rationale:** DNS remains on the Domain Controller since it's tightly coupled with AD. DHCP, File Server, and Backup roles live on a separate member server reflecting the real-world practice of keeping Domain Controllers lean and dedicated to identity services, rather than overloading them with unrelated infrastructure roles.
+
+## DHCP Server
+
+**Role installation:** Installed via Server Manager → Add Roles and Features → DHCP Server, then authorized in Active Directory via PowerShell:
+```powershell
+Add-DhcpServerInDC -DnsName "BERLIN-FS-01.divine.lab" -IPAddress 192.168.1.20
+```
+
+**Scope configuration:**
+
+| Setting | Value |
+|---|---|
+| Scope name | `Berlin_Clients_Scope` |
+| Range | `192.168.1.50` – `192.168.1.150` |
+| Subnet mask | `255.255.255.0` |
+| Lease duration | 8 days |
+| Exclusion range | `192.168.1.50` – `192.168.1.60` (reserved for static assignments) |
+
+**Reservation:**
+
+| Setting | Value |
+|---|---|
+| Client | `ENPAL-SRV01` |
+| Reserved IP | `192.168.1.100` |
+| MAC address | `08-00-27-1a-6f-92` |
+
+**Verification:** Ran `ipconfig /renew` on `ENPAL-SRV01`. Confirmed it received the exact reserved address from the correct DHCP server:
+```
+IPv4 Address:    192.168.1.100
+DHCP Server:     192.168.1.20
+DNS Servers:     192.168.1.10
+Lease Obtained:  29 August 2026
+Lease Expires:   6 September 2026
+```
+This confirms the DHCP server is correctly authorized, scoped, and serving addresses/reservations to real clients on the network not just installed without error.
+
+## File Server (FSRM Quotas)
+
+**Roles installed:** File and Storage Services, File Server Resource Manager (FSRM).
+
+**Department share structure:**
+
+| Folder | Quota Limit | Type |
+|---|---|---|
+| `C:\Shares\IT` | 5 GB | Hard |
+| `C:\Shares\Finance` | 2 GB | Hard |
+
+**Why hard quotas:** a hard quota actively blocks writes once the limit is reached, unlike a soft quota which only sends a warning while still allowing the limit to be exceeded. For genuine storage control preventing one department from consuming the whole disk — hard quotas are the correct choice.
+
+**Verification:** attempted to create a file larger than the IT folder's 5GB limit using `fsutil file createnew testfile.bin 5500000000`. The operation was rejected with `Error: There is not enough space on the disk`, confirming the quota is actively enforced at the file-system level, not just displayed as a configured value in the console.
+
+## Windows Server Backup
+
+**Feature installed:** Windows Server Backup, targeting the department share data (`C:\Shares`).
+
+**Backup configuration:** rather than using the GUI scheduling wizard which requires dedicating an entire disk exclusively to scheduled backups — the recurring schedule was configured via `wbadmin`, which supports scheduling backups directly to a network share target:
+```
+wbadmin enable backup -addtarget:\\BERLIN-FS-01\LocalBackups -schedule:21:00 -include:C:\Shares -quiet
+```
+
+**Verification steps:**
+1. Ran an initial manual backup (`wbadmin start backup ...`) and confirmed success via `Get-WBSummary` (`LastBackupResultHR: 0`)
+2. Enabled the recurring schedule and confirmed via `Get-WBSummary` that `NextBackupTime` populated correctly, proving the schedule was genuinely registered rather than merely attempted
+3. **Performed a full restore test** the step that actually proves a backup is usable, not just "completed without error":
+   - Created a test file inside `C:\Shares\IT`, backed it up
+   - Deleted the file to simulate real data loss
+   - Used the Windows Server Backup Recovery wizard to restore the specific deleted file to its original location
+   - Confirmed the restored file was present with its original content intact via `Get-Content`
+
+This restore test is the most important part of the Backup deliverable an untested backup is only a hope, not a verified safety net.
+
+## Troubleshooting Log
+
+| Issue | Root Cause | Resolution |
+|---|---|---|
+| New VM defaulted to unattended install, failed with "Windows cannot find the Microsoft Software License Terms" | Known VirtualBox bug with the unattended-install feature on certain ISO/version combinations | Recreated the VM with unattended installation unchecked, installed manually instead |
+| `FileServer03` could `ping`/`nslookup` the DC's IP directly but with "Destination host unreachable" replies from itself | Network adapter was set to NAT instead of Internal Network — completely different virtual network from the DC and client | Changed Adapter 1 to Internal Network, matching the exact network name used by the DC and client |
+| First domain join attempt failed: "The specified domain either does not exist or could not be contacted" | Attempted a computer rename and domain join simultaneously in one step | Retried the domain join as an isolated step |
+| `Add-DhcpServerInDC` failed with Kerberos/WinRM error via the GUI wizard | Flaky WinRM/Kerberos handshake specific to the GUI post-install wizard | Ran the equivalent `Add-DhcpServerInDC` PowerShell cmdlet directly instead |
+| `Add-DhcpServerInDC` failed repeatedly with Error 20070 ("Failed to initialize directory service resources"), persisting even after fixing the system clock | **Root cause 1:** VirtualBox was reverting the VM's clock away from the correct time within seconds of manually setting it, despite the host clock itself being correct. **Root cause 2:** Separately, the command was being run while logged in as the *local* `berlin-fs-01\administrator` account rather than a domain account — local accounts have no permissions in Active Directory regardless of the account name | **For the clock:** permanently disabled VirtualBox's host time sync at the hypervisor level for both VMs via `VBoxManage setextradata <VM> "VBoxInternal/Devices/VMMDev/0/Config/GetHostTimeDisabled" 1`, run from the host machine with each VM powered off — rather than continuing to manually correct the clock every session. **For the account:** logged out and back in with a proper domain account, confirmed via `whoami` showing `divine\username` instead of `berlin-fs-01\username`, after which authorization succeeded |
+| `Add-DhcpServerv4ExclusionRange` failed on a second exclusion attempt | Typo — used `192.168.0.60` (wrong third octet) instead of `192.168.1.60`, placing the range in a different subnet than the scope | Not re-attempted since the first exclusion range already covered lab needs; noted here as a reminder to double-check subnet octets carefully when scripting network ranges |
+| Restore wizard brought back the wrong file after a simulated deletion | During the recovery wizard's file browser, an existing file (`project_notes.txt`) was selected instead of the intended deleted test file, which Windows Server Backup restored as a timestamped copy rather than flagging an error | Deleted the incorrect result, re-ran the Recovery wizard, and carefully selected the correct file this time by verifying its exact name in the backup catalog before confirming the restore |
+
+## Known Simplifications / Notes
+
+- `BERLIN-FS-01` runs Windows Server 2022, matching the DC — though the lab was briefly considered with Server 2025 during initial VM creation before settling on 2022 for consistency
+- Lease duration left at the 8-day default rather than tuned for a specific use case, since this is a lab environment rather than a production network with device-turnover patterns to optimize against
+
+## Skills Demonstrated
+
+- Multi-server Active Directory infrastructure design (role separation from the Domain Controller)
+- DHCP Server installation, authorization, and scope configuration
+- DHCP exclusion ranges and static reservations
+- End-to-end verification methodology (not just "no errors" confirmed actual client behavior)
+- VirtualBox networking troubleshooting (NAT vs. Internal Network)
+- Root-cause diagnosis of a recurring Kerberos/clock-sync issue, resolved permanently at the hypervisor level rather than patched repeatedly
+- Local vs. domain account permission troubleshooting in Active Directory contexts
+- File Server Resource Manager (FSRM) quota configuration and hard-limit enforcement testing
+- Windows Server Backup: scheduled job configuration via command line (`wbadmin`) as an alternative to GUI-only workflows
+- Full backup/restore lifecycle verification treating "backup completed" and "data is actually recoverable" as two separate, both-necessary proofs
+
 ---
 
-*This document will be extended as File Server (with FSRM quotas) and Windows Server Backup are configured.*
+*All four core deliverables for this project DHCP, DNS integration, File Server with quotas, and Windows Server Backup with a verified restore are complete as documented above.*
+
